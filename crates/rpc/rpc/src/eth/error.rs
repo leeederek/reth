@@ -5,7 +5,9 @@ use jsonrpsee::{
     core::Error as RpcError,
     types::{error::CALL_EXECUTION_FAILED_CODE, ErrorObject},
 };
-use reth_primitives::{abi::decode_revert_reason, Address, Bytes, U256};
+use reth_primitives::{
+    abi::decode_revert_reason, Address, BlobTransactionValidationError, Bytes, U256,
+};
 use reth_revm::tracing::js::JsInspectorError;
 use reth_rpc_types::{error::EthRpcErrorCode, BlockError, CallInputError};
 use reth_transaction_pool::error::{InvalidPoolTransactionError, PoolError, PoolTransactionError};
@@ -470,6 +472,12 @@ pub enum RpcPoolError {
     /// Custom pool error
     #[error("{0:?}")]
     PoolTransactionError(Box<dyn PoolTransactionError>),
+    /// Unable to find the blob for an EIP4844 transaction
+    #[error("blob not found for EIP4844 transaction")]
+    MissingEip4844Blob,
+    /// Thrown if validating the blob sidecar for the transaction failed.
+    #[error(transparent)]
+    InvalidEip4844Blob(BlobTransactionValidationError),
     #[error(transparent)]
     Other(Box<dyn std::error::Error + Send + Sync>),
 }
@@ -508,6 +516,13 @@ impl From<InvalidPoolTransactionError> for RpcPoolError {
             InvalidPoolTransactionError::OversizedData(_, _) => RpcPoolError::OversizedData,
             InvalidPoolTransactionError::Underpriced => RpcPoolError::Underpriced,
             InvalidPoolTransactionError::Other(err) => RpcPoolError::PoolTransactionError(err),
+            InvalidPoolTransactionError::MissingEip4844Blob => RpcPoolError::MissingEip4844Blob,
+            InvalidPoolTransactionError::InvalidEip4844Blob(err) => {
+                RpcPoolError::InvalidEip4844Blob(err)
+            }
+            InvalidPoolTransactionError::Eip4844NonceGap => {
+                RpcPoolError::Invalid(RpcInvalidTransactionError::NonceTooHigh)
+            }
         }
     }
 }
