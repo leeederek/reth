@@ -21,11 +21,14 @@ pub enum PrunePart {
 }
 
 /// PrunePart error type.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum PrunePartError {
     /// Invalid configuration of a prune part.
     #[error("The configuration provided for {0} is invalid.")]
     Configuration(PrunePart),
+    /// Receipts have been pruned
+    #[error("Receipts have been pruned")]
+    ReceiptsPruned,
 }
 
 #[cfg(test)]

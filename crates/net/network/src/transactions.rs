@@ -20,9 +20,8 @@ use reth_metrics::common::mpsc::UnboundedMeteredReceiver;
 use reth_network_api::{Peers, ReputationChangeKind};
 use reth_primitives::{
     FromRecoveredPooledTransaction, IntoRecoveredTransaction, PeerId, PooledTransactionsElement,
-    TransactionSigned, TxHash, TxType, H256,
+    TransactionSigned, TxHash, B256,
 };
-use reth_rlp::Encodable;
 use reth_transaction_pool::{
     error::PoolResult, GetPooledTransactionLimit, PoolTransaction, PropagateKind,
     PropagatedTransactions, TransactionPool, ValidPoolTransaction,
@@ -60,13 +59,13 @@ const GET_POOLED_TRANSACTION_SOFT_LIMIT_SIZE: GetPooledTransactionLimit =
 pub type PoolImportFuture = Pin<Box<dyn Future<Output = PoolResult<TxHash>> + Send + 'static>>;
 
 /// Api to interact with [`TransactionsManager`] task.
+#[derive(Debug)]
 pub struct TransactionsHandle {
     /// Command channel to the [`TransactionsManager`]
     manager_tx: mpsc::UnboundedSender<TransactionsCommand>,
 }
 
-// === impl TransactionsHandle ===
-
+/// Implementation of the `TransactionsHandle` API.
 impl TransactionsHandle {
     fn send(&self, cmd: TransactionsCommand) {
         let _ = self.manager_tx.send(cmd);
@@ -75,6 +74,40 @@ impl TransactionsHandle {
     /// Manually propagate the transaction that belongs to the hash.
     pub fn propagate(&self, hash: TxHash) {
         self.send(TransactionsCommand::PropagateHash(hash))
+    }
+
+    /// Manually propagate the transaction hash to a specific peer.
+    ///
+    /// Note: this only propagates if the pool contains the transaction.
+    pub fn propagate_hash_to(&self, hash: TxHash, peer: PeerId) {
+        self.propagate_hashes_to(Some(hash), peer)
+    }
+
+    /// Manually propagate the transaction hashes to a specific peer.
+    ///
+    /// Note: this only propagates the transactions that are known to the pool.
+    pub fn propagate_hashes_to(&self, hash: impl IntoIterator<Item = TxHash>, peer: PeerId) {
+        self.send(TransactionsCommand::PropagateHashesTo(hash.into_iter().collect(), peer))
+    }
+
+    /// Request the active peer IDs from the [`TransactionsManager`].
+    pub fn get_active_peers(&self) {
+        self.send(TransactionsCommand::GetActivePeers)
+    }
+
+    /// Manually propagate full transactions to a specific peer.
+    pub fn propagate_transactions_to(&self, transactions: Vec<TxHash>, peer: PeerId) {
+        self.send(TransactionsCommand::PropagateTransactionsTo(transactions, peer))
+    }
+
+    /// Request the transaction hashes known by specific peers.
+    pub fn get_transaction_hashes(&self, peers: Vec<PeerId>) {
+        self.send(TransactionsCommand::GetTransactionHashes(peers))
+    }
+
+    /// Request the transaction hashes known by a specific peer.
+    pub fn get_peer_transaction_hashes(&self, peer: PeerId) {
+        self.send(TransactionsCommand::GetPeerTransactionHashes(peer))
     }
 }
 
@@ -94,6 +127,7 @@ impl TransactionsHandle {
 ///
 /// It is directly connected to the [`TransactionPool`] to retrieve requested transactions and
 /// propagate new transactions over the network.
+#[derive(Debug)]
 #[must_use = "Manager does nothing unless polled."]
 pub struct TransactionsManager<Pool> {
     /// Access to the transaction pool.
@@ -174,8 +208,14 @@ where
         TransactionsHandle { manager_tx: self.command_tx.clone() }
     }
 
+    #[inline]
     fn update_import_metrics(&self) {
         self.metrics.pending_pool_imports.set(self.pool_imports.len() as f64);
+    }
+
+    #[inline]
+    fn update_request_metrics(&self) {
+        self.metrics.inflight_transaction_requests.set(self.inflight_requests.len() as f64);
     }
 
     /// Request handler for an incoming request for transactions
@@ -199,7 +239,7 @@ where
         }
     }
 
-    /// Invoked when a new transaction is pending.
+    /// Invoked when a new transaction is pending in the local pool.
     ///
     /// When new transactions appear in the pool, we propagate them to the network using the
     /// `Transactions` and `NewPooledTransactionHashes` messages. The Transactions message relays
@@ -218,15 +258,10 @@ where
 
         trace!(target: "net::tx", "Start propagating transactions");
 
+        // This fetches all transaction from the pool, including the blob transactions, which are
+        // only ever sent as hashes.
         let propagated = self.propagate_transactions(
-            self.pool
-                .get_all(hashes)
-                .into_iter()
-                .map(|tx| {
-                    let tx = Arc::new(tx.transaction.to_recovered_transaction().into_signed());
-                    PropagateTransaction::new(tx)
-                })
-                .collect(),
+            self.pool.get_all(hashes).into_iter().map(PropagateTransaction::new).collect(),
         );
 
         // notify pool so events get fired
@@ -236,9 +271,9 @@ where
     /// Propagate the transactions to all connected peers either as full objects or hashes
     ///
     /// The message for new pooled hashes depends on the negotiated version of the stream.
-    /// See [NewPooledTransactionHashes](NewPooledTransactionHashes)
+    /// See [NewPooledTransactionHashes]
     ///
-    /// TODO add note that this never broadcasts full 4844 transactions
+    /// Note: EIP-4844 are disallowed from being broadcast in full and are only ever sent as hashes, see also <https://eips.ethereum.org/EIPS/eip-4844#networking>.
     fn propagate_transactions(
         &mut self,
         to_propagate: Vec<PropagateTransaction>,
@@ -270,7 +305,7 @@ where
                     //  via `GetPooledTransactions`.
                     //
                     // From: <https://eips.ethereum.org/EIPS/eip-4844#networking>
-                    if tx.tx_type() != TxType::EIP4844 {
+                    if !tx.transaction.is_eip4844() {
                         full_transactions.push(tx);
                     }
                 }
@@ -309,6 +344,57 @@ where
         self.metrics.propagated_transactions.increment(propagated.0.len() as u64);
 
         propagated
+    }
+
+    /// Propagate the transaction hashes to the given peer
+    ///
+    /// Note: This will only send the hashes for transactions that exist in the pool.
+    fn propagate_hashes_to(&mut self, hashes: Vec<TxHash>, peer_id: PeerId) {
+        trace!(target: "net::tx", "Start propagating transactions as hashes");
+
+        // This fetches a transactions from the pool, including the blob transactions, which are
+        // only ever sent as hashes.
+        let propagated = {
+            let Some(peer) = self.peers.get_mut(&peer_id) else {
+                // no such peer
+                return
+            };
+
+            let to_propagate: Vec<PropagateTransaction> =
+                self.pool.get_all(hashes).into_iter().map(PropagateTransaction::new).collect();
+
+            let mut propagated = PropagatedTransactions::default();
+
+            // check if transaction is known to peer
+            let mut hashes = PooledTransactionsHashesBuilder::new(peer.version);
+
+            for tx in to_propagate {
+                if peer.transactions.insert(tx.hash()) {
+                    hashes.push(&tx);
+                }
+            }
+
+            let new_pooled_hashes = hashes.build();
+
+            if new_pooled_hashes.is_empty() {
+                // nothing to propagate
+                return
+            }
+
+            for hash in new_pooled_hashes.iter_hashes().copied() {
+                propagated.0.entry(hash).or_default().push(PropagateKind::Hash(peer_id));
+            }
+            // send hashes of transactions
+            self.network.send_transactions_hashes(peer_id, new_pooled_hashes);
+
+            // Update propagated transactions metrics
+            self.metrics.propagated_transactions.increment(propagated.0.len() as u64);
+
+            propagated
+        };
+
+        // notify pool so events get fired
+        self.pool.on_propagated(propagated);
     }
 
     /// Request handler for an incoming `NewPooledTransactionHashes`
@@ -404,6 +490,13 @@ where
     fn on_command(&mut self, cmd: TransactionsCommand) {
         match cmd {
             TransactionsCommand::PropagateHash(hash) => self.on_new_transactions(vec![hash]),
+            TransactionsCommand::PropagateHashesTo(hashes, peer) => {
+                self.propagate_hashes_to(hashes, peer)
+            }
+            TransactionsCommand::GetActivePeers => todo!(),
+            TransactionsCommand::PropagateTransactionsTo(_txs, _peer) => todo!(),
+            TransactionsCommand::GetTransactionHashes(_peers) => todo!(),
+            TransactionsCommand::GetPeerTransactionHashes(_peer) => todo!(),
         }
     }
 
@@ -591,6 +684,8 @@ where
             this.on_network_tx_event(event);
         }
 
+        this.update_request_metrics();
+
         // Advance all requests.
         while let Poll::Ready(Some(GetPooledTxResponse { peer_id, result })) =
             this.inflight_requests.poll_next_unpin(cx)
@@ -609,6 +704,7 @@ where
             }
         }
 
+        this.update_request_metrics();
         this.update_import_metrics();
 
         // Advance all imports
@@ -663,12 +759,11 @@ impl PropagateTransaction {
         self.transaction.hash()
     }
 
-    fn tx_type(&self) -> TxType {
-        self.transaction.tx_type()
-    }
-
-    fn new(transaction: Arc<TransactionSigned>) -> Self {
-        Self { size: transaction.length(), transaction }
+    /// Create a new instance from a pooled transaction
+    fn new<T: PoolTransaction>(tx: Arc<ValidPoolTransaction<T>>) -> Self {
+        let size = tx.encoded_length;
+        let transaction = Arc::new(tx.transaction.to_recovered_transaction().into_signed());
+        Self { size, transaction }
     }
 }
 
@@ -813,9 +908,10 @@ impl Future for GetPooledTxRequestFut {
 }
 
 /// Tracks a single peer
+#[derive(Debug)]
 struct Peer {
     /// Keeps track of transactions that we know the peer has seen.
-    transactions: LruCache<H256>,
+    transactions: LruCache<B256>,
     /// A communication channel directly to the peer's session task.
     request_tx: PeerRequestSender,
     /// negotiated version of the session.
@@ -825,9 +921,21 @@ struct Peer {
     client_version: Arc<String>,
 }
 
-/// Commands to send to the [`TransactionsManager`](crate::transactions::TransactionsManager)
+/// Commands to send to the [`TransactionsManager`]
+#[derive(Debug)]
 enum TransactionsCommand {
-    PropagateHash(H256),
+    /// Propagate a transaction hash to the network.
+    PropagateHash(B256),
+    /// Propagate transaction hashes to a specific peer.
+    PropagateHashesTo(Vec<B256>, PeerId),
+    /// Request the list of active peer IDs from the [`TransactionsManager`].
+    GetActivePeers,
+    /// Propagate a collection of full transactions to a specific peer.
+    PropagateTransactionsTo(Vec<TxHash>, PeerId),
+    /// Request transaction hashes known by specific peers from the [`TransactionsManager`].
+    GetTransactionHashes(Vec<PeerId>),
+    /// Request transaction hashes known by a specific peer from the [`TransactionsManager`].
+    GetPeerTransactionHashes(PeerId),
 }
 
 /// All events related to transactions emitted by the network.
@@ -852,10 +960,11 @@ pub enum NetworkTransactionEvent {
 mod tests {
     use super::*;
     use crate::{test_utils::Testnet, NetworkConfigBuilder, NetworkManager};
+    use alloy_rlp::Decodable;
     use reth_interfaces::sync::{NetworkSyncUpdater, SyncState};
     use reth_network_api::NetworkInfo;
+    use reth_primitives::hex;
     use reth_provider::test_utils::NoopProvider;
-    use reth_rlp::Decodable;
     use reth_transaction_pool::test_utils::{testing_pool, MockTransaction};
     use secp256k1::SecretKey;
     use std::future::poll_fn;
@@ -928,7 +1037,7 @@ mod tests {
             }
         }
         // random tx: <https://etherscan.io/getRawTx?tx=0x9448608d36e721ef403c53b00546068a6474d6cbab6816c3926de449898e7bce>
-        let input = hex::decode("02f871018302a90f808504890aef60826b6c94ddf4c5025d1a5742cf12f74eec246d4432c295e487e09c3bbcc12b2b80c080a0f21a4eacd0bf8fea9c5105c543be5a1d8c796516875710fafafdf16d16d8ee23a001280915021bb446d1973501a67f93d2b38894a514b976e7b46dc2fe54598d76").unwrap();
+        let input = hex!("02f871018302a90f808504890aef60826b6c94ddf4c5025d1a5742cf12f74eec246d4432c295e487e09c3bbcc12b2b80c080a0f21a4eacd0bf8fea9c5105c543be5a1d8c796516875710fafafdf16d16d8ee23a001280915021bb446d1973501a67f93d2b38894a514b976e7b46dc2fe54598d76");
         let signed_tx = TransactionSigned::decode(&mut &input[..]).unwrap();
         transactions.on_network_tx_event(NetworkTransactionEvent::IncomingTransactions {
             peer_id: *handle1.peer_id(),
@@ -1014,7 +1123,7 @@ mod tests {
             }
         }
         // random tx: <https://etherscan.io/getRawTx?tx=0x9448608d36e721ef403c53b00546068a6474d6cbab6816c3926de449898e7bce>
-        let input = hex::decode("02f871018302a90f808504890aef60826b6c94ddf4c5025d1a5742cf12f74eec246d4432c295e487e09c3bbcc12b2b80c080a0f21a4eacd0bf8fea9c5105c543be5a1d8c796516875710fafafdf16d16d8ee23a001280915021bb446d1973501a67f93d2b38894a514b976e7b46dc2fe54598d76").unwrap();
+        let input = hex!("02f871018302a90f808504890aef60826b6c94ddf4c5025d1a5742cf12f74eec246d4432c295e487e09c3bbcc12b2b80c080a0f21a4eacd0bf8fea9c5105c543be5a1d8c796516875710fafafdf16d16d8ee23a001280915021bb446d1973501a67f93d2b38894a514b976e7b46dc2fe54598d76");
         let signed_tx = TransactionSigned::decode(&mut &input[..]).unwrap();
         transactions.on_network_tx_event(NetworkTransactionEvent::IncomingTransactions {
             peer_id: *handle1.peer_id(),
@@ -1097,7 +1206,7 @@ mod tests {
             }
         }
         // random tx: <https://etherscan.io/getRawTx?tx=0x9448608d36e721ef403c53b00546068a6474d6cbab6816c3926de449898e7bce>
-        let input = hex::decode("02f871018302a90f808504890aef60826b6c94ddf4c5025d1a5742cf12f74eec246d4432c295e487e09c3bbcc12b2b80c080a0f21a4eacd0bf8fea9c5105c543be5a1d8c796516875710fafafdf16d16d8ee23a001280915021bb446d1973501a67f93d2b38894a514b976e7b46dc2fe54598d76").unwrap();
+        let input = hex!("02f871018302a90f808504890aef60826b6c94ddf4c5025d1a5742cf12f74eec246d4432c295e487e09c3bbcc12b2b80c080a0f21a4eacd0bf8fea9c5105c543be5a1d8c796516875710fafafdf16d16d8ee23a001280915021bb446d1973501a67f93d2b38894a514b976e7b46dc2fe54598d76");
         let signed_tx = TransactionSigned::decode(&mut &input[..]).unwrap();
         transactions.on_network_tx_event(NetworkTransactionEvent::IncomingTransactions {
             peer_id: *handle1.peer_id(),

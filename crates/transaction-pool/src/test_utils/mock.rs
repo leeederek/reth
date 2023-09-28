@@ -16,16 +16,17 @@ use reth_primitives::{
     hex, Address, FromRecoveredPooledTransaction, FromRecoveredTransaction,
     IntoRecoveredTransaction, PooledTransactionsElementEcRecovered, Signature, Transaction,
     TransactionKind, TransactionSigned, TransactionSignedEcRecovered, TxEip1559, TxEip2930,
-    TxEip4844, TxHash, TxLegacy, TxType, H256, U128, U256,
+    TxEip4844, TxHash, TxLegacy, TxType, B256, EIP1559_TX_TYPE_ID, EIP4844_TX_TYPE_ID,
+    LEGACY_TX_TYPE_ID, U128, U256,
 };
 use std::{ops::Range, sync::Arc, time::Instant};
 
-pub(crate) type MockTxPool = TxPool<MockOrdering>;
+pub type MockTxPool = TxPool<MockOrdering>;
 
 pub type MockValidTx = ValidPoolTransaction<MockTransaction>;
 
 /// Create an empty `TxPool`
-pub(crate) fn mock_tx_pool() -> MockTxPool {
+pub fn mock_tx_pool() -> MockTxPool {
     MockTxPool::new(Default::default(), Default::default())
 }
 
@@ -61,25 +62,21 @@ macro_rules! get_value {
 // Generates all setters and getters
 macro_rules! make_setters_getters {
     ($($name:ident => $t:ty);*) => {
-  paste! {
-        $(
+        paste! {$(
             pub fn [<set_ $name>](&mut self, $name: $t) -> &mut Self {
                 set_value!(self => $name);
                 self
             }
 
-            pub fn [<with_$name>](mut self, $name: $t) -> Self {
+            pub fn [<with_ $name>](mut self, $name: $t) -> Self {
                 set_value!(self => $name);
                 self
             }
 
-            pub fn [<get_$name>](&self) -> $t {
+            pub fn [<get_ $name>](&self) -> $t {
                 get_value!(self => $name).clone()
             }
-
-        )*
-
-    }
+        )*}
     };
 }
 
@@ -87,7 +84,7 @@ macro_rules! make_setters_getters {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum MockTransaction {
     Legacy {
-        hash: H256,
+        hash: B256,
         sender: Address,
         nonce: u64,
         gas_price: u128,
@@ -96,7 +93,7 @@ pub enum MockTransaction {
         value: U256,
     },
     Eip1559 {
-        hash: H256,
+        hash: B256,
         sender: Address,
         nonce: u64,
         max_fee_per_gas: u128,
@@ -106,7 +103,7 @@ pub enum MockTransaction {
         value: U256,
     },
     Eip4844 {
-        hash: H256,
+        hash: B256,
         sender: Address,
         nonce: u64,
         max_fee_per_gas: u128,
@@ -123,7 +120,7 @@ pub enum MockTransaction {
 impl MockTransaction {
     make_setters_getters! {
         nonce => u64;
-        hash => H256;
+        hash => B256;
         sender => Address;
         gas_limit => u64;
         value => U256
@@ -132,7 +129,7 @@ impl MockTransaction {
     /// Returns a new legacy transaction with random address and hash and empty values
     pub fn legacy() -> Self {
         MockTransaction::Legacy {
-            hash: H256::random(),
+            hash: B256::random(),
             sender: Address::random(),
             nonce: 0,
             gas_price: 0,
@@ -145,7 +142,7 @@ impl MockTransaction {
     /// Returns a new EIP1559 transaction with random address and hash and empty values
     pub fn eip1559() -> Self {
         MockTransaction::Eip1559 {
-            hash: H256::random(),
+            hash: B256::random(),
             sender: Address::random(),
             nonce: 0,
             max_fee_per_gas: MIN_PROTOCOL_BASE_FEE as u128,
@@ -156,10 +153,10 @@ impl MockTransaction {
         }
     }
 
-    /// Returns a new EIP1559 transaction with random address and hash and empty values
+    /// Returns a new EIP4844 transaction with random address and hash and empty values
     pub fn eip4844() -> Self {
         MockTransaction::Eip4844 {
-            hash: H256::random(),
+            hash: B256::random(),
             sender: Address::random(),
             nonce: 0,
             max_fee_per_gas: MIN_PROTOCOL_BASE_FEE as u128,
@@ -286,19 +283,19 @@ impl MockTransaction {
 
     /// Returns a clone with a decreased nonce
     pub fn prev(&self) -> Self {
-        let mut next = self.clone().with_hash(H256::random());
+        let mut next = self.clone().with_hash(B256::random());
         next.with_nonce(self.get_nonce() - 1)
     }
 
     /// Returns a clone with an increased nonce
     pub fn next(&self) -> Self {
-        let mut next = self.clone().with_hash(H256::random());
+        let mut next = self.clone().with_hash(B256::random());
         next.with_nonce(self.get_nonce() + 1)
     }
 
     /// Returns a clone with an increased nonce
     pub fn skip(&self, skip: u64) -> Self {
-        let mut next = self.clone().with_hash(H256::random());
+        let mut next = self.clone().with_hash(B256::random());
         next.with_nonce(self.get_nonce() + skip + 1)
     }
 
@@ -310,7 +307,7 @@ impl MockTransaction {
 
     /// Sets a new random hash
     pub fn rng_hash(mut self) -> Self {
-        self.with_hash(H256::random())
+        self.with_hash(B256::random())
     }
 
     /// Returns a new transaction with a higher gas price +1
@@ -349,6 +346,14 @@ impl MockTransaction {
         let mut next = self.clone();
         let gas = self.get_gas_limit() + 1;
         next.with_gas_limit(gas)
+    }
+
+    pub fn tx_type(&self) -> u8 {
+        match self {
+            Self::Legacy { .. } => LEGACY_TX_TYPE_ID,
+            Self::Eip1559 { .. } => EIP1559_TX_TYPE_ID,
+            Self::Eip4844 { .. } => EIP4844_TX_TYPE_ID,
+        }
     }
 
     pub fn is_legacy(&self) -> bool {
@@ -493,13 +498,13 @@ impl FromRecoveredTransaction for MockTransaction {
         let hash = transaction.hash();
         match transaction.transaction {
             Transaction::Legacy(TxLegacy {
-                chain_id,
+                chain_id: _,
                 nonce,
                 gas_price,
                 gas_limit,
                 to,
                 value,
-                input,
+                input: _,
             }) => MockTransaction::Legacy {
                 hash,
                 sender,
@@ -510,15 +515,15 @@ impl FromRecoveredTransaction for MockTransaction {
                 value: U256::from(value),
             },
             Transaction::Eip1559(TxEip1559 {
-                chain_id,
+                chain_id: _,
                 nonce,
                 gas_limit,
                 max_fee_per_gas,
                 max_priority_fee_per_gas,
                 to,
                 value,
-                input,
-                access_list,
+                input: _,
+                access_list: _,
             }) => MockTransaction::Eip1559 {
                 hash,
                 sender,
@@ -530,15 +535,15 @@ impl FromRecoveredTransaction for MockTransaction {
                 value: U256::from(value),
             },
             Transaction::Eip4844(TxEip4844 {
-                chain_id,
+                chain_id: _,
                 nonce,
                 gas_limit,
                 max_fee_per_gas,
                 max_priority_fee_per_gas,
                 to,
                 value,
-                input,
-                access_list,
+                input: _,
+                access_list: _,
                 blob_versioned_hashes: _,
                 max_fee_per_blob_gas,
             }) => MockTransaction::Eip4844 {
@@ -573,7 +578,7 @@ impl IntoRecoveredTransaction for MockTransaction {
             gas_price: self.get_gas_price(),
             gas_limit: self.get_gas_limit(),
             to: TransactionKind::Call(Address::from_slice(
-                &hex::decode("d3e8763675e4c425df46cc3b5c0f6cbdac396046").unwrap()[..],
+                &hex!("d3e8763675e4c425df46cc3b5c0f6cbdac396046")[..],
             )),
             value: 693361000000000u64.into(),
             input: Default::default(),
@@ -595,7 +600,7 @@ impl proptest::arbitrary::Arbitrary for MockTransaction {
     fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
         use proptest::prelude::{any, Strategy};
 
-        any::<(Transaction, Address, H256)>()
+        any::<(Transaction, Address, B256)>()
             .prop_map(|(tx, sender, tx_hash)| match &tx {
                 Transaction::Legacy(TxLegacy {
                     nonce,
@@ -714,6 +719,10 @@ impl MockTransactionFactory {
 
     pub fn create_eip1559(&mut self) -> MockValidTx {
         self.validated(MockTransaction::eip1559())
+    }
+
+    pub fn create_eip4844(&mut self) -> MockValidTx {
+        self.validated(MockTransaction::eip4844())
     }
 }
 

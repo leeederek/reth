@@ -25,7 +25,10 @@ use eyre::Context;
 use fdlimit::raise_fd_limit;
 use futures::{future::Either, pin_mut, stream, stream_select, StreamExt};
 use reth_auto_seal_consensus::{AutoSealBuilder, AutoSealConsensus, MiningMode};
-use reth_beacon_consensus::{BeaconConsensus, BeaconConsensusEngine, MIN_BLOCKS_FOR_PIPELINE_RUN};
+use reth_beacon_consensus::{
+    hooks::{EngineHooks, PruneHook},
+    BeaconConsensus, BeaconConsensusEngine, MIN_BLOCKS_FOR_PIPELINE_RUN,
+};
 use reth_blockchain_tree::{
     config::BlockchainTreeConfig, externals::TreeExternals, BlockchainTree, ShareableBlockchainTree,
 };
@@ -43,14 +46,15 @@ use reth_interfaces::{
         either::EitherDownloader,
         headers::{client::HeadersClient, downloader::HeaderDownloader},
     },
+    RethResult,
 };
 use reth_network::{error::NetworkError, NetworkConfig, NetworkHandle, NetworkManager};
-use reth_network_api::NetworkInfo;
+use reth_network_api::{NetworkInfo, PeersInfo};
 use reth_primitives::{
     constants::eip4844::{LoadKzgSettingsError, MAINNET_KZG_TRUSTED_SETUP},
     kzg::KzgSettings,
     stage::StageId,
-    BlockHashOrNumber, BlockNumber, ChainSpec, DisplayHardforks, Head, SealedHeader, H256,
+    BlockHashOrNumber, BlockNumber, ChainSpec, DisplayHardforks, Head, SealedHeader, B256,
 };
 use reth_provider::{
     providers::BlockchainProvider, BlockHashReader, BlockReader, CanonStateSubscriptions,
@@ -267,6 +271,9 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
         let metrics_listener = MetricsListener::new(metrics_rx);
         ctx.task_executor.spawn_critical("metrics listener task", metrics_listener);
 
+        let prune_config =
+            self.pruning.prune_config(Arc::clone(&self.chain))?.or(config.prune.clone());
+
         // configure blockchain tree
         let tree_externals = TreeExternals::new(
             db.clone(),
@@ -284,6 +291,7 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
                 tree_externals,
                 canon_state_notification_sender.clone(),
                 tree_config,
+                prune_config.clone().map(|config| config.parts),
             )?
             .with_sync_metrics_tx(metrics_tx.clone()),
         );
@@ -342,7 +350,7 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
                 default_peers_path,
             )
             .await?;
-        info!(target: "reth::cli", peer_id = %network.peer_id(), local_addr = %network.local_addr(), "Connected to P2P network");
+        info!(target: "reth::cli", peer_id = %network.peer_id(), local_addr = %network.local_addr(), enode = %network.local_node_record(), "Connected to P2P network");
         debug!(target: "reth::cli", peer_id = ?network.peer_id(), "Full peer ID");
         let network_client = network.fetch_client().await?;
 
@@ -364,9 +372,6 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
         } else {
             None
         };
-
-        let prune_config =
-            self.pruning.prune_config(Arc::clone(&self.chain))?.or(config.prune.clone());
 
         // Configure the pipeline
         let (mut pipeline, client) = if self.dev.dev {
@@ -445,16 +450,23 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
             None
         };
 
-        let pruner = prune_config.map(|prune_config| {
-            info!(target: "reth::cli", "Pruner initialized");
-            reth_prune::Pruner::new(
+        let mut hooks = EngineHooks::new();
+
+        let pruner_events = if let Some(prune_config) = prune_config {
+            info!(target: "reth::cli", ?prune_config, "Pruner initialized");
+            let mut pruner = reth_prune::Pruner::new(
                 db.clone(),
                 self.chain.clone(),
                 prune_config.block_interval,
                 prune_config.parts,
                 self.chain.prune_batch_sizes,
-            )
-        });
+            );
+            let events = pruner.events();
+            hooks.add(PruneHook::new(pruner, Box::new(ctx.task_executor.clone())));
+            Either::Left(events)
+        } else {
+            Either::Right(stream::empty())
+        };
 
         // Configure the consensus engine
         let (beacon_consensus_engine, beacon_engine_handle) = BeaconConsensusEngine::with_channel(
@@ -470,7 +482,7 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
             MIN_BLOCKS_FOR_PIPELINE_RUN,
             consensus_engine_tx,
             consensus_engine_rx,
-            pruner,
+            hooks,
         )?;
         info!(target: "reth::cli", "Consensus engine initialized");
 
@@ -485,7 +497,8 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
                 )
             } else {
                 Either::Right(stream::empty())
-            }
+            },
+            pruner_events.map(Into::into)
         );
         ctx.task_executor.spawn_critical(
             "events task",
@@ -597,7 +610,7 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
     /// `MAINNET_KZG_TRUSTED_SETUP`.
     fn kzg_settings(&self) -> eyre::Result<Arc<KzgSettings>> {
         if let Some(ref trusted_setup_file) = self.trusted_setup_file {
-            let trusted_setup = KzgSettings::load_trusted_setup_file(trusted_setup_file.into())
+            let trusted_setup = KzgSettings::load_trusted_setup_file(trusted_setup_file)
                 .map_err(LoadKzgSettingsError::KzgError)?;
             Ok(Arc::new(trusted_setup))
         } else {
@@ -657,7 +670,7 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
         Ok(handle)
     }
 
-    fn lookup_head(&self, db: Arc<DatabaseEnv>) -> Result<Head, reth_interfaces::Error> {
+    fn lookup_head(&self, db: Arc<DatabaseEnv>) -> RethResult<Head> {
         let factory = ProviderFactory::new(db, self.chain.clone());
         let provider = factory.provider()?;
 
@@ -690,10 +703,10 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
     /// NOTE: The download is attempted with infinite retries.
     async fn lookup_or_fetch_tip<DB, Client>(
         &self,
-        db: &DB,
+        db: DB,
         client: Client,
-        tip: H256,
-    ) -> Result<u64, reth_interfaces::Error>
+        tip: B256,
+    ) -> RethResult<u64>
     where
         DB: Database,
         Client: HeadersClient,
@@ -706,10 +719,10 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
     /// NOTE: The download is attempted with infinite retries.
     async fn fetch_tip<DB, Client>(
         &self,
-        db: &DB,
+        db: DB,
         client: Client,
         tip: BlockHashOrNumber,
-    ) -> Result<SealedHeader, reth_interfaces::Error>
+    ) -> RethResult<SealedHeader>
     where
         DB: Database,
         Client: HeadersClient,
@@ -798,7 +811,7 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
             builder = builder.with_max_block(max_block)
         }
 
-        let (tip_tx, tip_rx) = watch::channel(H256::zero());
+        let (tip_tx, tip_rx) = watch::channel(B256::ZERO);
         use reth_revm_inspectors::stack::InspectorStackConfig;
         let factory = reth_revm::Factory::new(self.chain.clone());
 
@@ -845,6 +858,7 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
                         ExecutionStageThresholds {
                             max_blocks: stage_config.execution.max_blocks,
                             max_changes: stage_config.execution.max_changes,
+                            max_cumulative_gas: stage_config.execution.max_cumulative_gas,
                         },
                         stage_config
                             .merkle
@@ -864,7 +878,10 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
                     stage_config.storage_hashing.commit_threshold,
                 ))
                 .set(MerkleStage::new_execution(stage_config.merkle.clean_threshold))
-                .set(TransactionLookupStage::new(stage_config.transaction_lookup.commit_threshold))
+                .set(TransactionLookupStage::new(
+                    stage_config.transaction_lookup.commit_threshold,
+                    prune_modes.clone(),
+                ))
                 .set(IndexAccountHistoryStage::new(
                     stage_config.index_account_history.commit_threshold,
                     prune_modes.clone(),

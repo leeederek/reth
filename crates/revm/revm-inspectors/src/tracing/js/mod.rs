@@ -11,13 +11,13 @@ use crate::tracing::{
     utils::get_create_address,
 };
 use boa_engine::{Context, JsError, JsObject, JsResult, JsValue, Source};
-use reth_primitives::{bytes::Bytes, Account, Address, H256, U256};
+use reth_primitives::{Account, Address, Bytes, B256, U256};
 use revm::{
     interpreter::{
         return_revert, CallInputs, CallScheme, CreateInputs, Gas, InstructionResult, Interpreter,
     },
     precompile::Precompiles,
-    primitives::{Env, ExecutionResult, Output, ResultAndState, TransactTo, B160, B256},
+    primitives::{Env, ExecutionResult, Output, ResultAndState, TransactTo},
     Database, EVMData, Inspector,
 };
 use tokio::sync::mpsc;
@@ -287,24 +287,18 @@ impl<DB> Inspector<DB> for JsInspector
 where
     DB: Database,
 {
-    fn step(
-        &mut self,
-        interp: &mut Interpreter,
-        data: &mut EVMData<'_, DB>,
-        _is_static: bool,
-    ) -> InstructionResult {
+    fn step(&mut self, interp: &mut Interpreter, data: &mut EVMData<'_, DB>) -> InstructionResult {
         if self.step_fn.is_none() {
             return InstructionResult::Continue
         }
 
         let db = EvmDb::new(data.journaled_state.state.clone(), self.to_db_service.clone());
 
-        let pc = interp.program_counter();
         let step = StepLog {
             stack: StackObj(interp.stack.clone()),
-            op: interp.contract.bytecode.bytecode()[pc].into(),
+            op: interp.current_opcode().into(),
             memory: MemoryObj(interp.memory.clone()),
-            pc: pc as u64,
+            pc: interp.program_counter() as u64,
             gas_remaining: interp.gas.remaining(),
             cost: interp.gas.spend(),
             depth: data.journaled_state.depth(),
@@ -322,7 +316,7 @@ where
     fn log(
         &mut self,
         _evm_data: &mut EVMData<'_, DB>,
-        _address: &B160,
+        _address: &Address,
         _topics: &[B256],
         _data: &Bytes,
     ) {
@@ -332,7 +326,6 @@ where
         &mut self,
         interp: &mut Interpreter,
         data: &mut EVMData<'_, DB>,
-        _is_static: bool,
         eval: InstructionResult,
     ) -> InstructionResult {
         if self.step_fn.is_none() {
@@ -342,12 +335,11 @@ where
         if matches!(eval, return_revert!()) {
             let db = EvmDb::new(data.journaled_state.state.clone(), self.to_db_service.clone());
 
-            let pc = interp.program_counter();
             let step = StepLog {
                 stack: StackObj(interp.stack.clone()),
-                op: interp.contract.bytecode.bytecode()[pc].into(),
+                op: interp.current_opcode().into(),
                 memory: MemoryObj(interp.memory.clone()),
-                pc: pc as u64,
+                pc: interp.program_counter() as u64,
                 gas_remaining: interp.gas.remaining(),
                 cost: interp.gas.spend(),
                 depth: data.journaled_state.depth(),
@@ -366,7 +358,6 @@ where
         &mut self,
         data: &mut EVMData<'_, DB>,
         inputs: &mut CallInputs,
-        _is_static: bool,
     ) -> (InstructionResult, Gas, Bytes) {
         self.register_precompiles(&data.precompiles);
 
@@ -410,7 +401,6 @@ where
         remaining_gas: Gas,
         ret: InstructionResult,
         out: Bytes,
-        _is_static: bool,
     ) -> (InstructionResult, Gas, Bytes) {
         if self.exit_fn.is_some() {
             let frame_result =
@@ -429,7 +419,7 @@ where
         &mut self,
         data: &mut EVMData<'_, DB>,
         inputs: &mut CreateInputs,
-    ) -> (InstructionResult, Option<B160>, Gas, Bytes) {
+    ) -> (InstructionResult, Option<Address>, Gas, Bytes) {
         self.register_precompiles(&data.precompiles);
 
         let _ = data.journaled_state.load_account(inputs.caller, data.db);
@@ -461,10 +451,10 @@ where
         _data: &mut EVMData<'_, DB>,
         _inputs: &CreateInputs,
         ret: InstructionResult,
-        address: Option<B160>,
+        address: Option<Address>,
         remaining_gas: Gas,
         out: Bytes,
-    ) -> (InstructionResult, Option<B160>, Gas, Bytes) {
+    ) -> (InstructionResult, Option<Address>, Gas, Bytes) {
         if self.exit_fn.is_some() {
             let frame_result =
                 FrameResult { gas_used: remaining_gas.spend(), output: out.clone(), error: None };
@@ -478,7 +468,7 @@ where
         (ret, address, remaining_gas, out)
     }
 
-    fn selfdestruct(&mut self, _contract: B160, _target: B160) {
+    fn selfdestruct(&mut self, _contract: Address, _target: Address, _value: U256) {
         if self.enter_fn.is_some() {
             let call = self.active_call();
             let frame =
@@ -501,7 +491,7 @@ pub enum JsDbRequest {
     /// Bindings for [Database::code_by_hash]
     Code {
         /// The code hash of the code to be loaded
-        code_hash: H256,
+        code_hash: B256,
         /// The response channel
         resp: std::sync::mpsc::Sender<Result<Bytes, String>>,
     },

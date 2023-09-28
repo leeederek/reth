@@ -2,7 +2,7 @@
 
 use crate::eth::error::EthApiError;
 use jsonrpsee::core::RpcResult;
-use reth_interfaces::Result as RethResult;
+use reth_interfaces::RethResult;
 use reth_primitives::Block;
 use std::fmt::Display;
 
@@ -101,7 +101,7 @@ macro_rules! impl_to_rpc_result {
     };
 }
 
-impl_to_rpc_result!(reth_interfaces::Error);
+impl_to_rpc_result!(reth_interfaces::RethError);
 impl_to_rpc_result!(reth_network_api::NetworkError);
 
 /// An extension to used to apply error conversions to various result types
@@ -165,8 +165,8 @@ pub(crate) fn rpc_err(
         code,
         msg.into(),
         data.map(|data| {
-            jsonrpsee::core::to_json_raw_value(&format!("0x{}", hex::encode(data)))
-                .expect("serializing String does fail")
+            jsonrpsee::core::to_json_raw_value(&reth_primitives::hex::encode_prefixed(data))
+                .expect("serializing String can't fail")
         }),
     )
 }
@@ -174,16 +174,17 @@ pub(crate) fn rpc_err(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reth_interfaces::RethError;
 
     fn assert_rpc_result<Ok, Err, T: ToRpcResult<Ok, Err>>() {}
 
-    fn to_reth_err<Ok>(o: Ok) -> reth_interfaces::Result<Ok> {
+    fn to_reth_err<Ok>(o: Ok) -> RethResult<Ok> {
         Ok(o)
     }
 
     #[test]
     fn can_convert_rpc() {
-        assert_rpc_result::<(), reth_interfaces::Error, reth_interfaces::Result<()>>();
+        assert_rpc_result::<(), RethError, RethResult<()>>();
         let res = to_reth_err(100);
 
         let rpc_res = res.map_internal_err(|_| "This is a message");

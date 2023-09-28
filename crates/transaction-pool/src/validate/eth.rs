@@ -2,14 +2,17 @@
 
 use crate::{
     blobstore::BlobStore,
-    error::InvalidPoolTransactionError,
+    error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
     traits::TransactionOrigin,
     validate::{ValidTransaction, ValidationTask, MAX_INIT_CODE_SIZE, TX_MAX_SIZE},
     EthBlobTransactionSidecar, EthPoolTransaction, TransactionValidationOutcome,
     TransactionValidationTaskExecutor, TransactionValidator,
 };
 use reth_primitives::{
-    constants::{eip4844::MAINNET_KZG_TRUSTED_SETUP, ETHEREUM_BLOCK_GAS_LIMIT},
+    constants::{
+        eip4844::{MAINNET_KZG_TRUSTED_SETUP, MAX_BLOBS_PER_BLOCK},
+        ETHEREUM_BLOCK_GAS_LIMIT,
+    },
     kzg::KzgSettings,
     ChainSpec, InvalidTransactionError, SealedBlock, EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID,
     EIP4844_TX_TYPE_ID, LEGACY_TX_TYPE_ID,
@@ -209,6 +212,30 @@ where
                 )
             }
 
+            let blob_count = transaction.blob_count();
+            if blob_count == 0 {
+                // no blobs
+                return TransactionValidationOutcome::Invalid(
+                    transaction,
+                    InvalidPoolTransactionError::Eip4844(
+                        Eip4844PoolTransactionError::NoEip4844Blobs,
+                    ),
+                )
+            }
+
+            if blob_count > MAX_BLOBS_PER_BLOCK {
+                // too many blobs
+                return TransactionValidationOutcome::Invalid(
+                    transaction,
+                    InvalidPoolTransactionError::Eip4844(
+                        Eip4844PoolTransactionError::TooManyEip4844Blobs {
+                            have: blob_count,
+                            permitted: MAX_BLOBS_PER_BLOCK,
+                        },
+                    ),
+                )
+            }
+
             // extract the blob from the transaction
             match transaction.take_blob() {
                 EthBlobTransactionSidecar::None => {
@@ -224,7 +251,9 @@ where
                     } else {
                         return TransactionValidationOutcome::Invalid(
                             transaction,
-                            InvalidPoolTransactionError::MissingEip4844Blob,
+                            InvalidPoolTransactionError::Eip4844(
+                                Eip4844PoolTransactionError::MissingEip4844BlobSidecar,
+                            ),
                         )
                     }
                 }
@@ -234,7 +263,9 @@ where
                         if let Err(err) = eip4844.validate_blob(&blob, &self.kzg_settings) {
                             return TransactionValidationOutcome::Invalid(
                                 transaction,
-                                InvalidPoolTransactionError::InvalidEip4844Blob(err),
+                                InvalidPoolTransactionError::Eip4844(
+                                    Eip4844PoolTransactionError::InvalidEip4844Blob(err),
+                                ),
                             )
                         }
                         // store the extracted blob
@@ -307,11 +338,11 @@ where
 
     fn on_new_head_block(&self, new_tip_block: &SealedBlock) {
         // update all forks
-        if self.chain_spec.is_cancun_activated_at_timestamp(new_tip_block.timestamp) {
+        if self.chain_spec.is_cancun_active_at_timestamp(new_tip_block.timestamp) {
             self.fork_tracker.cancun.store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
-        if self.chain_spec.is_shanghai_activated_at_timestamp(new_tip_block.timestamp) {
+        if self.chain_spec.is_shanghai_active_at_timestamp(new_tip_block.timestamp) {
             self.fork_tracker.shanghai.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -349,6 +380,9 @@ pub struct EthTransactionValidatorBuilder {
 impl EthTransactionValidatorBuilder {
     /// Creates a new builder for the given [ChainSpec]
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
+        // If cancun is enabled at genesis, enable it
+        let cancun = chain_spec.is_cancun_active_at_timestamp(chain_spec.genesis_timestamp());
+
         Self {
             chain_spec,
             block_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT,
@@ -367,7 +401,7 @@ impl EthTransactionValidatorBuilder {
             shanghai: true,
 
             // TODO: can hard enable by default once mainnet transitioned
-            cancun: false,
+            cancun,
         }
     }
 

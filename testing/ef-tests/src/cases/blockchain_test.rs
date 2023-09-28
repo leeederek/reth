@@ -4,10 +4,10 @@ use crate::{
     models::{BlockchainTest, ForkSpec, RootOrState},
     Case, Error, Suite,
 };
+use alloy_rlp::Decodable;
 use reth_db::test_utils::create_test_rw_db;
 use reth_primitives::{BlockBody, SealedBlock};
 use reth_provider::{BlockWriter, ProviderFactory};
-use reth_rlp::Decodable;
 use reth_stages::{stages::ExecutionStage, ExecInput, Stage};
 use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 
@@ -81,6 +81,7 @@ impl Case for BlockchainTestCase {
             provider.insert_block(
                 SealedBlock::new(case.genesis_block_header.clone().into(), BlockBody::default()),
                 None,
+                None,
             )?;
             case.pre.write_to_db(provider.tx_ref())?;
 
@@ -88,7 +89,7 @@ impl Case for BlockchainTestCase {
             for block in case.blocks.iter() {
                 let decoded = SealedBlock::decode(&mut block.rlp.as_ref())?;
                 last_block = Some(decoded.number);
-                provider.insert_block(decoded, None)?;
+                provider.insert_block(decoded, None, None)?;
             }
 
             // Call execution stage

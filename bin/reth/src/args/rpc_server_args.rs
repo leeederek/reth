@@ -24,6 +24,7 @@ use reth_rpc::{
     },
     JwtError, JwtSecret,
 };
+
 use reth_rpc_builder::{
     auth::{AuthServerConfig, AuthServerHandle},
     constants,
@@ -50,9 +51,7 @@ pub(crate) const RPC_DEFAULT_MAX_REQUEST_SIZE_MB: u32 = 15;
 /// This is only relevant for very large trace responses.
 pub(crate) const RPC_DEFAULT_MAX_RESPONSE_SIZE_MB: u32 = 115;
 /// Default number of incoming connections.
-pub(crate) const RPC_DEFAULT_MAX_CONNECTIONS: u32 = 100;
-/// Default number of incoming connections.
-pub(crate) const RPC_DEFAULT_MAX_TRACING_REQUESTS: u32 = 25;
+pub(crate) const RPC_DEFAULT_MAX_CONNECTIONS: u32 = 500;
 
 /// Parameters for configuring the rpc more granularity via CLI
 #[derive(Debug, Args)]
@@ -135,8 +134,12 @@ pub struct RpcServerArgs {
     pub rpc_max_connections: u32,
 
     /// Maximum number of concurrent tracing requests.
-    #[arg(long, value_name = "COUNT", default_value_t = RPC_DEFAULT_MAX_TRACING_REQUESTS)]
+    #[arg(long, value_name = "COUNT", default_value_t = constants::DEFAULT_MAX_TRACING_REQUESTS)]
     pub rpc_max_tracing_requests: u32,
+
+    /// Maximum number of logs that can be returned in a single response.
+    #[arg(long, value_name = "COUNT", default_value_t = constants::DEFAULT_MAX_LOGS_PER_RESPONSE)]
+    pub rpc_max_logs_per_response: usize,
 
     /// Maximum gas limit for `eth_call` and call tracing RPC methods.
     #[arg(
@@ -315,6 +318,19 @@ impl RpcServerArgs {
 }
 
 impl RethRpcConfig for RpcServerArgs {
+    fn is_ipc_enabled(&self) -> bool {
+        // By default IPC is enabled therefor it is enabled if the `ipcdisable` is false.
+        !self.ipcdisable
+    }
+
+    fn eth_config(&self) -> EthConfig {
+        EthConfig::default()
+            .max_tracing_requests(self.rpc_max_tracing_requests)
+            .max_logs_per_response(self.rpc_max_logs_per_response)
+            .rpc_gas_cap(self.rpc_gas_cap)
+            .gpo_config(self.gas_price_oracle_config())
+    }
+
     fn rpc_max_request_size_bytes(&self) -> u32 {
         self.rpc_max_request_size * 1024 * 1024
     }
@@ -330,24 +346,6 @@ impl RethRpcConfig for RpcServerArgs {
             self.gas_price_oracle.max_price,
             self.gas_price_oracle.percentile,
         )
-    }
-
-    fn jwt_secret(&self, default_jwt_path: PathBuf) -> Result<JwtSecret, JwtError> {
-        match self.auth_jwtsecret.as_ref() {
-            Some(fpath) => {
-                debug!(target: "reth::cli", user_path=?fpath, "Reading JWT auth secret file");
-                JwtSecret::from_file(fpath)
-            }
-            None => {
-                if default_jwt_path.exists() {
-                    debug!(target: "reth::cli", ?default_jwt_path, "Reading JWT auth secret file");
-                    JwtSecret::from_file(&default_jwt_path)
-                } else {
-                    info!(target: "reth::cli", ?default_jwt_path, "Creating JWT auth secret file");
-                    JwtSecret::try_create(&default_jwt_path)
-                }
-            }
-        }
     }
 
     fn transport_rpc_module_config(&self) -> TransportRpcModuleConfig {
@@ -424,16 +422,22 @@ impl RethRpcConfig for RpcServerArgs {
         Ok(AuthServerConfig::builder(jwt_secret).socket_addr(address).build())
     }
 
-    fn is_ipc_enabled(&self) -> bool {
-        // By default IPC is enabled therefor it is enabled if the `ipcdisable` is false.
-        !self.ipcdisable
-    }
-
-    fn eth_config(&self) -> EthConfig {
-        EthConfig::default()
-            .max_tracing_requests(self.rpc_max_tracing_requests)
-            .rpc_gas_cap(self.rpc_gas_cap)
-            .gpo_config(self.gas_price_oracle_config())
+    fn jwt_secret(&self, default_jwt_path: PathBuf) -> Result<JwtSecret, JwtError> {
+        match self.auth_jwtsecret.as_ref() {
+            Some(fpath) => {
+                debug!(target: "reth::cli", user_path=?fpath, "Reading JWT auth secret file");
+                JwtSecret::from_file(fpath)
+            }
+            None => {
+                if default_jwt_path.exists() {
+                    debug!(target: "reth::cli", ?default_jwt_path, "Reading JWT auth secret file");
+                    JwtSecret::from_file(&default_jwt_path)
+                } else {
+                    info!(target: "reth::cli", ?default_jwt_path, "Creating JWT auth secret file");
+                    JwtSecret::try_create(&default_jwt_path)
+                }
+            }
+        }
     }
 }
 
@@ -534,6 +538,25 @@ mod tests {
             "reth",
             "--http.api",
             " eth, admin, debug",
+            "--http",
+            "--ws",
+        ])
+        .args;
+        let config = args.transport_rpc_module_config();
+        let expected = vec![RethRpcModule::Eth, RethRpcModule::Admin, RethRpcModule::Debug];
+        assert_eq!(config.http().cloned().unwrap().into_selection(), expected);
+        assert_eq!(
+            config.ws().cloned().unwrap().into_selection(),
+            RpcModuleSelection::standard_modules()
+        );
+    }
+
+    #[test]
+    fn test_unique_rpc_modules() {
+        let args = CommandParser::<RpcServerArgs>::parse_from([
+            "reth",
+            "--http.api",
+            " eth, admin, debug, eth,admin",
             "--http",
             "--ws",
         ])

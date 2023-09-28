@@ -41,6 +41,26 @@ impl ParityTraceBuilder {
         self.nodes.iter().map(|node| node.trace.caller).collect()
     }
 
+    /// Manually the gas used of the root trace.
+    ///
+    /// The root trace's gasUsed should mirror the actual gas used by the transaction.
+    ///
+    /// This allows setting it manually by consuming the execution result's gas for example.
+    #[inline]
+    pub fn set_transaction_gas_used(&mut self, gas_used: u64) {
+        if let Some(node) = self.nodes.first_mut() {
+            node.trace.gas_used = gas_used;
+        }
+    }
+
+    /// Convenience function for [ParityTraceBuilder::set_transaction_gas_used] that consumes the
+    /// type.
+    #[inline]
+    pub fn with_transaction_gas_used(mut self, gas_used: u64) -> Self {
+        self.set_transaction_gas_used(gas_used);
+        self
+    }
+
     /// Returns the trace addresses of all call nodes in the set
     ///
     /// Each entry in the returned vector represents the [Self::trace_address] of the corresponding
@@ -136,6 +156,7 @@ impl ParityTraceBuilder {
         res: ExecutionResult,
         trace_types: &HashSet<TraceType>,
     ) -> TraceResults {
+        let gas_used = res.gas_used();
         let output = match res {
             ExecutionResult::Success { output, .. } => output.into_data(),
             ExecutionResult::Revert { output, .. } => output,
@@ -144,12 +165,14 @@ impl ParityTraceBuilder {
 
         let (trace, vm_trace, state_diff) = self.into_trace_type_traces(trace_types);
 
-        TraceResults {
-            output: output.into(),
-            trace: trace.unwrap_or_default(),
-            vm_trace,
-            state_diff,
-        }
+        let mut trace =
+            TraceResults { output, trace: trace.unwrap_or_default(), vm_trace, state_diff };
+
+        // we're setting the gas used of the root trace explicitly to the gas used of the execution
+        // result
+        trace.set_root_trace_gas_used(gas_used);
+
+        trace
     }
 
     /// Consumes the inspector and returns the trace results according to the configured trace
@@ -371,7 +394,7 @@ impl ParityTraceBuilder {
 
         // Calculate the stack items at this step
         let push_stack = {
-            let step_op = step.op.u8();
+            let step_op = step.op.get();
             let show_stack: usize;
             if (opcode::PUSH0..=opcode::PUSH32).contains(&step_op) {
                 show_stack = 1;
@@ -397,7 +420,7 @@ impl ParityTraceBuilder {
                     opcode::ADD |
                     opcode::EXP |
                     opcode::CALLER |
-                    opcode::SHA3 |
+                    opcode::KECCAK256 |
                     opcode::SUB |
                     opcode::ADDRESS |
                     opcode::GAS |
@@ -455,7 +478,7 @@ impl ParityTraceBuilder {
         let cost = self
             .spec_id
             .and_then(|spec_id| {
-                spec_opcode_gas(spec_id).get(step.op.u8() as usize).map(|op| op.get_gas())
+                spec_opcode_gas(spec_id).get(step.op.get() as usize).map(|op| op.get_gas())
             })
             .unwrap_or_default();
 
@@ -508,7 +531,7 @@ where
 ///
 /// iteratively fill the [VmTrace] code fields
 pub(crate) fn populate_vm_trace_bytecodes<DB, I>(
-    db: &DB,
+    db: DB,
     trace: &mut VmTrace,
     breadth_first_addresses: I,
 ) -> Result<(), DB::Error>
@@ -534,7 +557,7 @@ where
 
         let code_hash = if db_acc.code_hash != KECCAK_EMPTY { db_acc.code_hash } else { continue };
 
-        curr_ref.code = db.code_by_hash(code_hash)?.original_bytes().into();
+        curr_ref.code = db.code_by_hash(code_hash)?.original_bytes();
     }
 
     Ok(())
@@ -544,8 +567,8 @@ where
 /// in the [ExecutionResult] state map and compares the balance and nonce against what's in the
 /// `db`, which should point to the beginning of the transaction.
 ///
-/// It's expected that `DB` is a [CacheDB](revm::db::CacheDB) which at this point already contains
-/// all the accounts that are in the state map and never has to fetch them from disk.
+/// It's expected that `DB` is a revm [Database](revm::db::Database) which at this point already
+/// contains all the accounts that are in the state map and never has to fetch them from disk.
 pub fn populate_account_balance_nonce_diffs<DB, I>(
     state_diff: &mut StateDiff,
     db: DB,

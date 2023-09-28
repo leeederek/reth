@@ -1,8 +1,8 @@
 use std::mem;
 
-use crate::{Address, H256};
+use crate::{Address, B256};
+use alloy_rlp::{RlpDecodable, RlpDecodableWrapper, RlpEncodable, RlpEncodableWrapper};
 use reth_codecs::{main_codec, Compact};
-use reth_rlp::{RlpDecodable, RlpDecodableWrapper, RlpEncodable, RlpEncodableWrapper};
 use revm_primitives::U256;
 use serde::{Deserialize, Serialize};
 
@@ -18,17 +18,17 @@ pub struct AccessListItem {
     #[cfg_attr(
         any(test, feature = "arbitrary"),
         proptest(
-            strategy = "proptest::collection::vec(proptest::arbitrary::any::<H256>(), 0..=20)"
+            strategy = "proptest::collection::vec(proptest::arbitrary::any::<B256>(), 0..=20)"
         )
     )]
-    pub storage_keys: Vec<H256>,
+    pub storage_keys: Vec<B256>,
 }
 
 impl AccessListItem {
     /// Calculates a heuristic for the in-memory size of the [AccessListItem].
     #[inline]
     pub fn size(&self) -> usize {
-        mem::size_of::<Address>() + self.storage_keys.capacity() * mem::size_of::<H256>()
+        mem::size_of::<Address>() + self.storage_keys.capacity() * mem::size_of::<B256>()
     }
 }
 
@@ -48,15 +48,17 @@ pub struct AccessList(
 impl AccessList {
     /// Converts the list into a vec, expected by revm
     pub fn flattened(self) -> Vec<(Address, Vec<U256>)> {
-        self.0
-            .into_iter()
-            .map(|item| {
-                (
-                    item.address,
-                    item.storage_keys.into_iter().map(|slot| U256::from_be_bytes(slot.0)).collect(),
-                )
-            })
-            .collect()
+        self.flatten().collect()
+    }
+
+    /// Returns an iterator over the list's addresses and storage keys.
+    pub fn flatten(self) -> impl Iterator<Item = (Address, Vec<U256>)> {
+        self.0.into_iter().map(|item| {
+            (
+                item.address,
+                item.storage_keys.into_iter().map(|slot| U256::from_be_bytes(slot.0)).collect(),
+            )
+        })
     }
 
     /// Calculates a heuristic for the in-memory size of the [AccessList].
